@@ -528,39 +528,40 @@ func (tx *Tx) write() error {
 	tx.pages = make(map[common.Pgid]*common.Page)
 	sort.Sort(pages)
 
-	// Write pages to disk in order.
+	// Collect all page writes into a slice so they can be submitted in one
+	// batch (e.g. via io-uring).  Each page may produce multiple requests
+	// when it exceeds MaxAllocSize.
+	var reqs []writeRequest
 	for _, p := range pages {
 		rem := (uint64(p.Overflow()) + 1) * uint64(tx.db.pageSize)
 		offset := int64(p.Id()) * int64(tx.db.pageSize)
 		var written uintptr
 
-		// Write out page in "max allocation" sized chunks.
 		for {
 			sz := rem
 			if sz > common.MaxAllocSize-1 {
 				sz = common.MaxAllocSize - 1
 			}
 			buf := common.UnsafeByteSlice(unsafe.Pointer(p), written, 0, int(sz))
+			reqs = append(reqs, writeRequest{buf: buf, offset: offset})
 
-			if _, err := tx.db.ops.writeAt(buf, offset); err != nil {
-				lg.Errorf("writeAt failed, offset: %d: %w", offset, err)
-				return err
-			}
-
-			// Update statistics.
-			tx.stats.IncWrite(1)
-
-			// Exit inner for loop if we've written all the chunks.
 			rem -= sz
 			if rem == 0 {
 				break
 			}
-
-			// Otherwise move offset forward and move pointer to next chunk.
 			offset += int64(sz)
 			written += uintptr(sz)
 		}
 	}
+
+	// Submit all writes in one call (sequential by default; io-uring when enabled).
+	if err := tx.db.ops.writeAll(reqs); err != nil {
+		lg.Errorf("writeAll failed: %v", err)
+		return err
+	}
+
+	// Update statistics: one write-syscall count per request submitted.
+	tx.stats.IncWrite(int64(len(reqs)))
 
 	// Ignore file sync if flag is set on DB.
 	if !tx.db.NoSync || common.IgnoreNoSync {

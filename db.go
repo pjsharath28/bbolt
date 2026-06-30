@@ -116,6 +116,14 @@ type DB struct {
 	// Supported only on Unix via mlock/munlock syscalls.
 	Mlock bool
 
+	// useIOUring indicates that io-uring was requested and successfully
+	// initialised for this database instance.
+	useIOUring bool
+
+	// ioUringWriter holds the active io-uring ring, or nil when io-uring is
+	// not in use.  It is closed by db.close().
+	ioUringWriter *ioUringWriter
+
 	logger Logger
 
 	path     string
@@ -148,7 +156,8 @@ type DB struct {
 	statlock sync.RWMutex // Protects stats access.
 
 	ops struct {
-		writeAt func(b []byte, off int64) (n int, err error)
+		writeAt  func(b []byte, off int64) (n int, err error)
+		writeAll func(reqs []writeRequest) error
 	}
 
 	// Read only mode.
@@ -192,6 +201,7 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 	db.FreelistType = options.FreelistType
 	db.Mlock = options.Mlock
 	db.MaxSize = options.MaxSize
+	db.useIOUring = options.UseIOUring
 
 	// Set default values for later DB operations.
 	db.MaxBatchSize = common.DefaultMaxBatchSize
@@ -258,6 +268,20 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 
 	// Default values for test hooks
 	db.ops.writeAt = db.file.WriteAt
+
+	// Default writeAll: sequential loop over writeAt (always safe).
+	db.ops.writeAll = func(reqs []writeRequest) error {
+		for i := range reqs {
+			if _, err := db.ops.writeAt(reqs[i].buf, reqs[i].offset); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Optionally replace writeAll with an io-uring-backed implementation.
+	// tryInitIOUring is a no-op on non-Linux platforms.
+	tryInitIOUring(db)
 
 	if db.pageSize = options.PageSize; db.pageSize == 0 {
 		// Set the default page size to the OS page size.
@@ -715,6 +739,15 @@ func (db *DB) close() error {
 
 	// Clear ops.
 	db.ops.writeAt = nil
+	db.ops.writeAll = nil
+
+	// Close io-uring ring if active.
+	if db.ioUringWriter != nil {
+		if err := db.ioUringWriter.close(); err != nil {
+			db.logger.Errorf("bolt.Close(): ioUringWriter.close error: %v", err)
+		}
+		db.ioUringWriter = nil
+	}
 
 	var errs []error
 	// Close the mmap.
@@ -1318,6 +1351,13 @@ func newFreelist(freelistType FreelistType) fl.Interface {
 	return fl.NewArrayFreelist()
 }
 
+// writeRequest describes a single pwrite operation: write buf at the given
+// file offset.  Used by ops.writeAll to batch page writes.
+type writeRequest struct {
+	buf    []byte
+	offset int64
+}
+
 // Options represents the options that can be set when opening a database.
 type Options struct {
 	// Timeout is the amount of time to wait to obtain a file lock.
@@ -1393,6 +1433,12 @@ type Options struct {
 	// return empty structure in this case. This can be beneficial for
 	// performance under high-concurrency read-only transactions.
 	NoStatistics bool
+
+	// UseIOUring enables io-uring for batching dirty-page writes during
+	// Tx.Commit on Linux (kernel ≥ 5.1).  On non-Linux platforms, or when
+	// the kernel does not support io-uring, this option is silently ignored
+	// and the standard sequential writeAt path is used.  Default: false.
+	UseIOUring bool
 }
 
 func (o *Options) String() string {
@@ -1400,8 +1446,8 @@ func (o *Options) String() string {
 		return "{}"
 	}
 
-	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t}",
-		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics)
+	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t, UseIOUring: %t}",
+		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics, o.UseIOUring)
 
 }
 
